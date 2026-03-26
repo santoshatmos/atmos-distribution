@@ -3,22 +3,34 @@ set -euo pipefail
 
 # vps-deploy.sh - ATMOS Production VPS One-Click Deployer
 #
-# Purpose:
-# - Install all dependencies on a fresh Ubuntu 22.04+ VPS
-# - Download the deployment tarball from a PUBLIC distribution repo
-# - Extract to /opt/atmos and start the installer
-# - Automatically detect install vs upgrade via state marker file
+# Versioned release layout (Capistrano-style):
+#   /opt/atmos/
+#   ©À©¤©¤ releases/
+#   ©¦   ©À©¤©¤ v1.0.0/
+#   ©¦   ©¸©¤©¤ v1.0.1/
+#   ©À©¤©¤ current -> releases/v1.0.1   (symlink, atomic switch)
+#   ©À©¤©¤ shared/
+#   ©¦   ©À©¤©¤ .env
+#   ©¦   ©À©¤©¤ .atmos/
+#   ©¦   ©À©¤©¤ .atmos_installed
+#   ©¦   ©À©¤©¤ acme/
+#   ©¦   ©¸©¤©¤ nginx/ssl/
+#   ©¸©¤©¤ scripts/
 #
 # Usage (first-time install or upgrade - auto-detected):
 #   curl -fsSL https://raw.githubusercontent.com/santoshatmos/atmos-distribution/main/scripts/vps-deploy.sh | bash
 #
 # Usage (with specific version):
-#   ATMOS_VERSION=v1.0.0 curl -fsSL https://raw.githubusercontent.com/santoshatmos/atmos-distribution/main/scripts/vps-deploy.sh | bash
+#   ATMOS_VERSION=v1.0.0 curl -fsSL ... | bash
+#
+# Rollback to previous version:
+#   curl -fsSL ... | bash -s -- --rollback
 #
 # Environment variables:
 #   ATMOS_VERSION          - Release tag to deploy (default: latest)
 #   ATMOS_INSTALL_ROOT     - Installation directory (default: /opt/atmos)
 #   ATMOS_RELEASE_BASE_URL - Override base URL for release artifacts
+#   ATMOS_KEEP_RELEASES    - Number of old releases to keep (default: 3)
 
 DIST_REPO_OWNER="${ATMOS_RELEASE_REPO_OWNER:-santoshatmos}"
 DIST_REPO_NAME="${ATMOS_RELEASE_REPO_NAME:-atmos-distribution}"
@@ -26,7 +38,20 @@ ATMOS_RELEASE_BASE_URL="${ATMOS_RELEASE_BASE_URL:-}"
 SCRIPT_URL="https://raw.githubusercontent.com/${DIST_REPO_OWNER}/${DIST_REPO_NAME}/main/scripts/vps-deploy.sh"
 VERSION="${ATMOS_VERSION:-latest}"
 INSTALL_ROOT="${ATMOS_INSTALL_ROOT:-/opt/atmos}"
-STATE_MARKER="$INSTALL_ROOT/.atmos_installed"
+RELEASES_DIR="$INSTALL_ROOT/releases"
+SHARED_DIR="$INSTALL_ROOT/shared"
+CURRENT_LINK="$INSTALL_ROOT/current"
+KEEP_RELEASES="${ATMOS_KEEP_RELEASES:-3}"
+
+# Shared items: paths relative to a release dir -> shared dir
+# Format: <relative_path_in_release>:<relative_path_in_shared>
+SHARED_ITEMS=(
+  ".env:.env"
+  ".atmos:.atmos"
+  ".atmos_installed:.atmos_installed"
+  "acme:acme"
+  "nginx/ssl:nginx/ssl"
+)
 
 MODE=""   # auto-detected below
 
@@ -39,35 +64,41 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --upgrade)   MODE="upgrade"; shift ;;
     --install)   MODE="install"; shift ;;
+    --rollback)  MODE="rollback"; shift ;;
     --version)   VERSION="$2"; shift 2 ;;
     --help|-h)
-      echo "Usage: $0 [--install|--upgrade] [--version vX.Y.Z]"
+      echo "Usage: $0 [--install|--upgrade|--rollback] [--version vX.Y.Z]"
       echo ""
       echo "Mode is auto-detected from the state marker file if not specified."
       echo ""
       echo "Options:"
       echo "  --install    Force fresh install"
       echo "  --upgrade    Force upgrade (preserves .env, SSL, volumes)"
+      echo "  --rollback   Revert to the previous release"
       echo "  --version    Specify release version (default: latest)"
       echo ""
       echo "Environment:"
       echo "  ATMOS_VERSION            Release tag (default: latest)"
       echo "  ATMOS_INSTALL_ROOT       Install directory (default: /opt/atmos)"
       echo "  ATMOS_RELEASE_BASE_URL   Override artifact base URL"
+      echo "  ATMOS_KEEP_RELEASES      Old releases to retain (default: 3)"
       exit 0
       ;;
     *) err "Unknown arg: $1"; exit 2 ;;
   esac
 done
 
-# Auto-detect mode from state marker
+# Auto-detect mode
 if [[ -z "$MODE" ]]; then
-  if [[ -f "$STATE_MARKER" ]]; then
+  if [[ -L "$CURRENT_LINK" ]]; then
     MODE="upgrade"
-    log "State marker found ($STATE_MARKER) - upgrade mode"
+    log "Versioned layout detected - upgrade mode"
+  elif [[ -f "$INSTALL_ROOT/.atmos_installed" && ! -d "$RELEASES_DIR" ]]; then
+    MODE="install"
+    log "Legacy flat layout detected - will wipe and do fresh versioned install"
   else
     MODE="install"
-    log "No state marker found - fresh install mode"
+    log "No existing installation found - fresh install mode"
   fi
 fi
 
@@ -99,14 +130,52 @@ write_local_wrapper() {
   local wrapper_dir="$INSTALL_ROOT/scripts"
   local wrapper_path="$wrapper_dir/vps-deploy.sh"
 
-  mkdir -p "$wrapper_dir"
-  cat > "$wrapper_path" <<'WRAPPER'
+  sudo_cmd mkdir -p "$wrapper_dir"
+  sudo_cmd tee "$wrapper_path" > /dev/null <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_URL="${ATMOS_RELEASE_SCRIPT_URL:-https://raw.githubusercontent.com/santoshatmos/atmos-distribution/main/scripts/vps-deploy.sh}"
 curl -fsSL --retry 3 --connect-timeout 10 "$SCRIPT_URL" | bash -s -- "$@"
 WRAPPER
-  chmod +x "$wrapper_path" 2>/dev/null || true
+  sudo_cmd chmod +x "$wrapper_path" 2>/dev/null || true
+}
+
+# Compute relative path from $1 to $2
+relpath() {
+  python3 -c "import os.path; print(os.path.relpath('$2','$1'))" 2>/dev/null \
+    || python -c "import os.path; print os.path.relpath('$2','$1')" 2>/dev/null \
+    || echo "$2"
+}
+
+# Create symlinks from release dir to shared dir for persistent data
+link_shared_into_release() {
+  local release_dir="$1"
+  local item rel_path shared_path parent_dir target
+  for item in "${SHARED_ITEMS[@]}"; do
+    rel_path="${item%%:*}"
+    shared_path="$SHARED_DIR/${item##*:}"
+    local dest="$release_dir/$rel_path"
+    parent_dir="$(dirname "$dest")"
+    sudo_cmd mkdir -p "$parent_dir"
+    # Remove any existing file/dir at destination (from tarball) so symlink succeeds
+    if [[ -e "$dest" && ! -L "$dest" ]]; then
+      sudo_cmd rm -rf "$dest"
+    fi
+    target="$(relpath "$parent_dir" "$shared_path")"
+    sudo_cmd ln -sfn "$target" "$dest"
+  done
+}
+
+# Wipe legacy flat layout before fresh versioned install
+wipe_legacy_flat_layout() {
+  log "Removing legacy flat layout at $INSTALL_ROOT..."
+  # Stop running containers first if docker-compose exists
+  if [[ -f "$INSTALL_ROOT/docker-compose.yml" ]]; then
+    (cd "$INSTALL_ROOT" && docker compose down 2>/dev/null) || true
+  fi
+  sudo_cmd rm -rf "$INSTALL_ROOT"
+  sudo_cmd mkdir -p "$INSTALL_ROOT"
+  log "Legacy layout removed. Starting fresh versioned install."
 }
 
 # =============================================================================
@@ -232,7 +301,7 @@ download_release() {
 }
 
 # =============================================================================
-# Step 4: Extract and install
+# Step 4: Extract and install (versioned)
 # =============================================================================
 extract_and_install() {
   local tarball="$1"
@@ -251,124 +320,147 @@ extract_and_install() {
     exit 1
   fi
 
-  # --- Backup critical data on upgrade ---
-  local env_backup="" acme_backup="" ssl_backup="" atmos_state_backup=""
-  if [[ "$MODE" == "upgrade" ]]; then
-    if [[ -f "$INSTALL_ROOT/.env" ]]; then
-      env_backup="$tmp_dir/.env.backup"
-      if sudo_cmd cp "$INSTALL_ROOT/.env" "$env_backup"; then
-        log "Backed up .env"
-      else
-        warn "Failed to back up .env (continuing)"
-        env_backup=""
-      fi
-    fi
-    if [[ -d "$INSTALL_ROOT/acme" ]]; then
-      acme_backup="$tmp_dir/acme.backup"
-      if sudo_cmd cp -a "$INSTALL_ROOT/acme" "$acme_backup"; then
-        log "Backed up acme/ (SSL certificates)"
-      else
-        warn "Failed to back up acme/ (continuing)"
-        acme_backup=""
-      fi
-    fi
-    if [[ -d "$INSTALL_ROOT/nginx/ssl" ]]; then
-      ssl_backup="$tmp_dir/ssl.backup"
-      if sudo_cmd cp -a "$INSTALL_ROOT/nginx/ssl" "$ssl_backup"; then
-        log "Backed up nginx/ssl/"
-      else
-        warn "Failed to back up nginx/ssl/ (continuing)"
-        ssl_backup=""
-      fi
-    fi
-    if [[ -d "$INSTALL_ROOT/.atmos" ]]; then
-      atmos_state_backup="$tmp_dir/atmos-state.backup"
-      if sudo_cmd cp -a "$INSTALL_ROOT/.atmos" "$atmos_state_backup"; then
-        log "Backed up .atmos/ (state)"
-      else
-        warn "Failed to back up .atmos/ (continuing)"
-        atmos_state_backup=""
-      fi
-    fi
+  # --- Wipe legacy flat layout if detected ---
+  if [[ ! -d "$RELEASES_DIR" && -f "$INSTALL_ROOT/.atmos_installed" ]]; then
+    wipe_legacy_flat_layout
   fi
 
-  # --- Deploy files ---
-  sudo_cmd mkdir -p "$INSTALL_ROOT"
+  # --- Ensure directory structure ---
+  sudo_cmd mkdir -p "$RELEASES_DIR" "$SHARED_DIR" "$SHARED_DIR/nginx"
 
-  if command -v rsync >/dev/null 2>&1; then
-    sudo_cmd rsync -a --delete \
-      --exclude '.env' \
-      --exclude '.atmos/' \
-      --exclude '.atmos_installed' \
-      --exclude 'acme/' \
-      --exclude 'nginx/ssl/' \
-      "$inner_dir/" "$INSTALL_ROOT/"
-  else
-    if [[ "$MODE" == "upgrade" ]]; then
-      local preserved_env=""
-      if [[ -f "$INSTALL_ROOT/.env" ]]; then
-        preserved_env="$tmp_dir/.env.preserved"
-        if ! sudo_cmd cp "$INSTALL_ROOT/.env" "$preserved_env"; then
-          warn "Failed to preserve .env before fallback copy (continuing)"
-          preserved_env=""
-        fi
-      fi
+  # --- Deploy release to releases/<version>/ ---
+  local release_dir="$RELEASES_DIR/$VERSION"
+  if [[ -d "$release_dir" ]]; then
+    log "Removing existing release directory: $release_dir"
+    sudo_cmd rm -rf "$release_dir"
+  fi
+  sudo_cmd cp -a "$inner_dir" "$release_dir"
+  log "Release extracted to: $release_dir"
+
+  # --- Initialize shared dir from first install ---
+  # Move any persistent data from the release into shared (first install only)
+  for item in "${SHARED_ITEMS[@]}"; do
+    local rel_path="${item%%:*}"
+    local shared_sub="${item##*:}"
+    local src="$release_dir/$rel_path"
+    local dst="$SHARED_DIR/$shared_sub"
+    if [[ -e "$src" && ! -L "$src" && ! -e "$dst" ]]; then
+      sudo_cmd mkdir -p "$(dirname "$dst")"
+      sudo_cmd mv "$src" "$dst"
     fi
-    sudo_cmd cp -a "$inner_dir/." "$INSTALL_ROOT/"
-    if [[ "$MODE" == "upgrade" && -n "${preserved_env:-}" && -f "$preserved_env" ]]; then
-      sudo_cmd cp -f "$preserved_env" "$INSTALL_ROOT/.env"
-    fi
+  done
+  # Ensure shared state dirs exist
+  sudo_cmd mkdir -p "$SHARED_DIR/.atmos/cache" "$SHARED_DIR/.atmos/presets" 2>/dev/null || true
+
+  # --- Symlink shared data into release ---
+  link_shared_into_release "$release_dir"
+
+  # --- Ensure binaries are executable ---
+  for bin in start.sh install.sh deploy.sh start-stack.sh launcher/atmos-launcher agent/atmos-agent; do
+    sudo_cmd chmod +x "$release_dir/$bin" 2>/dev/null || true
+  done
+
+  # --- Atomic switch: update current symlink ---
+  local prev_target=""
+  if [[ -L "$CURRENT_LINK" ]]; then
+    prev_target="$(readlink "$CURRENT_LINK")"
+  fi
+  sudo_cmd ln -sfn "releases/$VERSION" "$CURRENT_LINK"
+  log "Switched current -> releases/$VERSION"
+  if [[ -n "$prev_target" ]]; then
+    log "Previous release: $prev_target"
   fi
 
-  # --- Restore backups ---
-  if [[ -n "$env_backup" && -f "$env_backup" ]]; then
-    sudo_cmd cp -f "$env_backup" "$INSTALL_ROOT/.env"
-    log "Restored .env"
-  fi
-  if [[ -n "${acme_backup:-}" && -d "$acme_backup" ]]; then
-    sudo_cmd cp -a "$acme_backup/." "$INSTALL_ROOT/acme/"
-    log "Restored acme/"
-  fi
-  if [[ -n "${ssl_backup:-}" && -d "$ssl_backup" ]]; then
-    sudo_cmd cp -a "$ssl_backup/." "$INSTALL_ROOT/nginx/ssl/"
-    log "Restored nginx/ssl/"
-  fi
-  if [[ -n "${atmos_state_backup:-}" && -d "$atmos_state_backup" ]]; then
-    sudo_cmd cp -a "$atmos_state_backup/." "$INSTALL_ROOT/.atmos/"
-    log "Restored .atmos/"
-  fi
-
-  # Ensure binaries are executable
-  chmod +x "$INSTALL_ROOT/start.sh" 2>/dev/null || true
-  chmod +x "$INSTALL_ROOT/install.sh" 2>/dev/null || true
-  chmod +x "$INSTALL_ROOT/deploy.sh" 2>/dev/null || true
-  chmod +x "$INSTALL_ROOT/start-stack.sh" 2>/dev/null || true
-  chmod +x "$INSTALL_ROOT/launcher/atmos-launcher" 2>/dev/null || true
-  chmod +x "$INSTALL_ROOT/agent/atmos-agent" 2>/dev/null || true
-
-  # Ensure state directories exist
-  mkdir -p "$INSTALL_ROOT/.atmos/cache" "$INSTALL_ROOT/.atmos/presets" 2>/dev/null || true
-
-  # Cleanup temp
-  rm -rf "$tmp_dir"
+  # --- Cleanup temp (may contain root-owned files) ---
+  sudo_cmd rm -rf "$tmp_dir"
 
   # Recreate local wrapper for convenience
   write_local_wrapper
 
-  log "Files deployed to: $INSTALL_ROOT"
+  # --- Prune old releases ---
+  prune_old_releases
+
+  log "Files deployed to: $release_dir (current -> releases/$VERSION)"
+}
+
+# =============================================================================
+# Step 4b: Prune old releases
+# =============================================================================
+prune_old_releases() {
+  local count current_target
+  current_target="$(readlink "$CURRENT_LINK" 2>/dev/null | sed 's|^releases/||' || true)"
+  count=0
+  # List releases by modification time (newest first), skip current
+  while IFS= read -r dir; do
+    local base="$(basename "$dir")"
+    [[ "$base" == "$current_target" ]] && continue
+    count=$((count + 1))
+    if (( count > KEEP_RELEASES )); then
+      log "Pruning old release: $base"
+      sudo_cmd rm -rf "$dir"
+    fi
+  done < <(ls -1dt "$RELEASES_DIR"/*/ 2>/dev/null || true)
+}
+
+# =============================================================================
+# Step 4c: Rollback
+# =============================================================================
+do_rollback() {
+  if [[ ! -L "$CURRENT_LINK" ]]; then
+    err "No current symlink found. Cannot rollback."
+    exit 1
+  fi
+  local current_target
+  current_target="$(readlink "$CURRENT_LINK" | sed 's|^releases/||')"
+  log "Current release: $current_target"
+
+  # Find previous release (second newest by mtime)
+  local prev_release=""
+  while IFS= read -r dir; do
+    local base="$(basename "$dir")"
+    [[ "$base" == "$current_target" ]] && continue
+    prev_release="$base"
+    break
+  done < <(ls -1dt "$RELEASES_DIR"/*/ 2>/dev/null)
+
+  if [[ -z "$prev_release" ]]; then
+    err "No previous release found to rollback to."
+    exit 1
+  fi
+
+  log "Rolling back: $current_target -> $prev_release"
+  sudo_cmd ln -sfn "releases/$prev_release" "$CURRENT_LINK"
+
+  # Update state marker
+  local marker="$SHARED_DIR/.atmos_installed"
+  sudo_cmd tee "$marker" > /dev/null <<EOF
+# ATMOS installation state marker - DO NOT DELETE
+version=$prev_release
+installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+rollback_from=$current_target
+EOF
+  sudo_cmd tee "$SHARED_DIR/.atmos/version" > /dev/null <<< "$prev_release"
+
+  log "Rollback complete. Restarting services..."
+  (cd "$CURRENT_LINK" && docker compose up -d --force-recreate)
+  echo ""
+  echo "========================================="
+  echo "  ATMOS rolled back to $prev_release"
+  echo "========================================="
+  echo ""
 }
 
 # =============================================================================
 # Step 5: Post-install
 # =============================================================================
 post_install() {
-  # Record version
-  echo "$VERSION" > "$INSTALL_ROOT/.atmos/version" 2>/dev/null || true
+  # Record version in shared dir
+  sudo_cmd tee "$SHARED_DIR/.atmos/version" > /dev/null <<< "$VERSION"
 
   # Write state marker (enables auto-detection on next run)
-  cat > "$STATE_MARKER" <<EOF
+  local marker="$SHARED_DIR/.atmos_installed"
+  sudo_cmd tee "$marker" > /dev/null <<EOF
 # ATMOS installation state marker - DO NOT DELETE
-# Presence of this file tells vps-deploy.sh to run in upgrade mode.
 version=$VERSION
 installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
@@ -377,26 +469,40 @@ EOF
   echo "========================================="
   echo "  ATMOS $VERSION deployed to $INSTALL_ROOT"
   echo "  Mode: $MODE"
+  echo "  Layout: versioned (current -> releases/$VERSION)"
   echo "========================================="
+  echo ""
+
+  # List available releases
+  echo "Available releases:"
+  for d in "$RELEASES_DIR"/*/; do
+    local v="$(basename "$d")"
+    if [[ "$v" == "$VERSION" ]]; then
+      echo "  * $v  (active)"
+    else
+      echo "    $v"
+    fi
+  done
   echo ""
 
   if [[ "$MODE" == "upgrade" ]]; then
     echo "Upgrade complete. ATMOS will restart now."
     echo ""
-    echo "To upgrade again later:"
-    echo "  curl -fsSL $SCRIPT_URL | bash"
+    echo "To rollback:  curl -fsSL $SCRIPT_URL | bash -s -- --rollback"
+    echo "To upgrade:   curl -fsSL $SCRIPT_URL | bash"
     echo ""
   else
     echo "Install complete. ATMOS will start now."
     echo ""
     echo "Operations:"
+    echo "  cd $CURRENT_LINK"
     echo "  ./start.sh status    # System overview"
     echo "  ./start.sh health    # Container health"
     echo "  ./start.sh logs core # Stream engine logs"
     echo "  ./start.sh repair    # Restart stopped containers"
     echo ""
-    echo "To upgrade later:"
-    echo "  curl -fsSL $SCRIPT_URL | bash"
+    echo "To upgrade later:  curl -fsSL $SCRIPT_URL | bash"
+    echo "To rollback:       curl -fsSL $SCRIPT_URL | bash -s -- --rollback"
   fi
   echo ""
 }
@@ -405,6 +511,13 @@ EOF
 # Main
 # =============================================================================
 main() {
+  if [[ "$MODE" == "rollback" ]]; then
+    log "=== ATMOS VPS Deployer (mode=rollback) ==="
+    log ""
+    do_rollback
+    exit 0
+  fi
+
   log "=== ATMOS VPS Deployer (mode=$MODE) ==="
   log ""
 
@@ -414,8 +527,8 @@ main() {
   extract_and_install "$TARBALL_PATH" "$TEMP_DIR"
   post_install
 
-  log "Starting ATMOS from ${INSTALL_ROOT}..."
-  (cd "$INSTALL_ROOT" && ./start.sh)
+  log "Starting ATMOS from ${CURRENT_LINK}..."
+  (cd "$CURRENT_LINK" && ./start.sh)
 }
 
 main "$@"
