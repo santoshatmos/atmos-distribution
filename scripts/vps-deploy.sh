@@ -185,9 +185,11 @@ resolve_version() {
     VERSION="$tag"
   fi
 
-  # Build download base URL if not overridden
+  # Build download base URL if not overridden.
+  # GitHub Releases download URL pattern:
+  #   https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>
   if [[ -z "$ATMOS_RELEASE_BASE_URL" ]]; then
-    ATMOS_RELEASE_BASE_URL="https://raw.githubusercontent.com/${DIST_REPO_OWNER}/${DIST_REPO_NAME}/main/releases/${VERSION}"
+    ATMOS_RELEASE_BASE_URL="https://github.com/${DIST_REPO_OWNER}/${DIST_REPO_NAME}/releases/download/${VERSION}"
   fi
 
   log "Target version: $VERSION"
