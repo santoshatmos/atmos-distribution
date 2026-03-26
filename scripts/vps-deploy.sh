@@ -256,23 +256,39 @@ extract_and_install() {
   if [[ "$MODE" == "upgrade" ]]; then
     if [[ -f "$INSTALL_ROOT/.env" ]]; then
       env_backup="$tmp_dir/.env.backup"
-      cp "$INSTALL_ROOT/.env" "$env_backup"
-      log "Backed up .env"
+      if sudo_cmd cp "$INSTALL_ROOT/.env" "$env_backup"; then
+        log "Backed up .env"
+      else
+        warn "Failed to back up .env (continuing)"
+        env_backup=""
+      fi
     fi
     if [[ -d "$INSTALL_ROOT/acme" ]]; then
       acme_backup="$tmp_dir/acme.backup"
-      cp -a "$INSTALL_ROOT/acme" "$acme_backup"
-      log "Backed up acme/ (SSL certificates)"
+      if sudo_cmd cp -a "$INSTALL_ROOT/acme" "$acme_backup"; then
+        log "Backed up acme/ (SSL certificates)"
+      else
+        warn "Failed to back up acme/ (continuing)"
+        acme_backup=""
+      fi
     fi
     if [[ -d "$INSTALL_ROOT/nginx/ssl" ]]; then
       ssl_backup="$tmp_dir/ssl.backup"
-      cp -a "$INSTALL_ROOT/nginx/ssl" "$ssl_backup"
-      log "Backed up nginx/ssl/"
+      if sudo_cmd cp -a "$INSTALL_ROOT/nginx/ssl" "$ssl_backup"; then
+        log "Backed up nginx/ssl/"
+      else
+        warn "Failed to back up nginx/ssl/ (continuing)"
+        ssl_backup=""
+      fi
     fi
     if [[ -d "$INSTALL_ROOT/.atmos" ]]; then
       atmos_state_backup="$tmp_dir/atmos-state.backup"
-      cp -a "$INSTALL_ROOT/.atmos" "$atmos_state_backup"
-      log "Backed up .atmos/ (state)"
+      if sudo_cmd cp -a "$INSTALL_ROOT/.atmos" "$atmos_state_backup"; then
+        log "Backed up .atmos/ (state)"
+      else
+        warn "Failed to back up .atmos/ (continuing)"
+        atmos_state_backup=""
+      fi
     fi
   fi
 
@@ -292,7 +308,10 @@ extract_and_install() {
       local preserved_env=""
       if [[ -f "$INSTALL_ROOT/.env" ]]; then
         preserved_env="$tmp_dir/.env.preserved"
-        cp "$INSTALL_ROOT/.env" "$preserved_env"
+        if ! sudo_cmd cp "$INSTALL_ROOT/.env" "$preserved_env"; then
+          warn "Failed to preserve .env before fallback copy (continuing)"
+          preserved_env=""
+        fi
       fi
     fi
     sudo_cmd cp -a "$inner_dir/." "$INSTALL_ROOT/"
