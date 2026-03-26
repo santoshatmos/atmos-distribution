@@ -367,6 +367,15 @@ extract_and_install() {
       sudo_cmd mv "$src" "$dst"
     fi
   done
+  # Ensure shared .env exists on first install. Some release bundles only include
+  # .env.example, while current/.env is symlinked to shared/.env.
+  if [[ ! -e "$SHARED_DIR/.env" ]]; then
+    if [[ -f "$release_dir/.env" ]]; then
+      sudo_cmd cp -a "$release_dir/.env" "$SHARED_DIR/.env"
+    elif [[ -f "$release_dir/.env.example" ]]; then
+      sudo_cmd cp -a "$release_dir/.env.example" "$SHARED_DIR/.env"
+    fi
+  fi
   # Ensure shared state dirs exist
   sudo_cmd mkdir -p "$SHARED_DIR/.atmos/cache" "$SHARED_DIR/.atmos/presets" 2>/dev/null || true
 
