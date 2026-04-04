@@ -54,7 +54,6 @@ SHARED_ITEMS=(
 )
 
 MODE=""   # auto-detected below
-DEPLOYED_RELEASE_DIR=""
 
 log()  { echo "[atmos-deploy] $*"; }
 err()  { echo "[atmos-deploy] ERROR: $*" >&2; }
@@ -197,47 +196,6 @@ wipe_legacy_flat_layout() {
   log "Legacy layout removed. Starting fresh versioned install."
 }
 
-# During upgrade, stop any running stack from the previous current release
-# before starting the freshly deployed release. Use absolute paths so it works
-# even if caller shell cwd is invalid/deleted.
-stop_existing_stack_for_upgrade() {
-  if [[ "$MODE" != "upgrade" ]]; then
-    return 0
-  fi
-
-  if [[ ! -L "$CURRENT_LINK" ]]; then
-    warn "Upgrade mode but current symlink is missing: $CURRENT_LINK"
-    return 0
-  fi
-
-  local current_dir=""
-  current_dir="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
-  if [[ -z "$current_dir" || ! -d "$current_dir" ]]; then
-    warn "Unable to resolve current release directory for docker compose down: $CURRENT_LINK"
-    return 0
-  fi
-
-  local compose_file="$current_dir/docker-compose.yml"
-  if [[ ! -f "$compose_file" ]]; then
-    warn "Compose file not found in current release, skip down: $compose_file"
-    return 0
-  fi
-
-  log "Upgrade mode: stopping existing ATMOS stack from $current_dir ..."
-  if sudo_cmd docker compose --project-directory "$current_dir" -f "$compose_file" --profile "*" down; then
-    log "Existing stack stopped."
-    return 0
-  fi
-
-  warn "docker compose down with --profile \"*\" failed; retrying without profile selector..."
-  if sudo_cmd docker compose --project-directory "$current_dir" -f "$compose_file" down; then
-    log "Existing stack stopped (fallback mode)."
-    return 0
-  fi
-
-  warn "Failed to stop existing stack automatically. Continuing; start.sh may report occupied ports."
-}
-
 # =============================================================================
 # Step 1: Install system dependencies
 # =============================================================================
@@ -283,6 +241,23 @@ install_dependencies() {
   fi
 
   log "Dependencies OK: curl, tar, docker, docker compose"
+
+  printf '%s Suggested commands (try in order):
+' "$(ts)"
+  printf '%s   1) Show listeners:
+' "$(ts)"
+  printf '%s      sudo ss -lntp | egrep ":(80|443|8080)\\b"\n' "$(ts)"
+  printf '%s   2) If these ports are used by a previous ATMOS stack in this folder:
+' "$(ts)"
+  printf '%s      docker compose --profile "*" down
+' "$(ts)"
+  printf '%s   3) If you want a clean reset (WARNING: deletes volumes and data for this project):
+' "$(ts)"
+  printf '%s      docker compose --profile "*" down -v
+' "$(ts)"
+  printf '%s %s  4) EMERGENCY: Stop ALL containers system-wide (RISKY - affects other projects):%s\n' "$(ts)" "${red}" "${reset}"
+  printf '%s      docker stop $(docker ps -q)\n' "$(ts)"
+  printf '%s %s========================================%s\n' "$(ts)" "${yellow}" "${reset}"
 }
 
 # =============================================================================
@@ -389,36 +364,25 @@ extract_and_install() {
   sudo_cmd mkdir -p "$RELEASES_DIR" "$SHARED_DIR" "$SHARED_DIR/nginx"
 
   # --- Deploy release to releases/<version>/ ---
-  # Scheme B: if upgrading to the same active version, create a new unique
-  # release dir (vX.Y.Z-r<timestamp>) instead of deleting the active directory.
-  local release_name="$VERSION"
-  local release_dir="$RELEASES_DIR/$release_name"
+  # If target version equals currently active release, use timestamped directory to avoid
+  # deleting the in-use release (which causes getcwd errors for shells inside current/).
+  local release_dir="$RELEASES_DIR/$VERSION"
   local current_target=""
   if [[ -L "$CURRENT_LINK" ]]; then
-    current_target="$(readlink "$CURRENT_LINK")"
+    current_target="$(readlink "$CURRENT_LINK" 2>/dev/null | sed 's|^releases/||' || true)"
   fi
-
   if [[ -d "$release_dir" ]]; then
-    if [[ "$current_target" == "releases/$VERSION" ]]; then
+    if [[ "$current_target" == "$VERSION" ]]; then
       local ts
-      ts="$(date -u +%Y%m%d%H%M%S)"
-      release_name="${VERSION}-r${ts}"
-      release_dir="$RELEASES_DIR/$release_name"
-      while [[ -e "$release_dir" ]]; do
-        sleep 1
-        ts="$(date -u +%Y%m%d%H%M%S)"
-        release_name="${VERSION}-r${ts}"
-        release_dir="$RELEASES_DIR/$release_name"
-      done
-      log "Active release is releases/$VERSION; deploying to new directory: $release_dir"
+      ts="$(date +%s)"
+      release_dir="$RELEASES_DIR/${VERSION}-r${ts}"
+      log "Target version matches active release; creating timestamped directory: $(basename "$release_dir")"
     else
       log "Removing existing release directory: $release_dir"
       sudo_cmd rm -rf "$release_dir"
     fi
   fi
-
   sudo_cmd cp -a "$inner_dir" "$release_dir"
-  DEPLOYED_RELEASE_DIR="$release_name"
   log "Release extracted to: $release_dir"
 
   # --- Initialize shared dir from first install ---
@@ -458,8 +422,8 @@ extract_and_install() {
   if [[ -L "$CURRENT_LINK" ]]; then
     prev_target="$(readlink "$CURRENT_LINK")"
   fi
-  sudo_cmd ln -sfn "releases/$DEPLOYED_RELEASE_DIR" "$CURRENT_LINK"
-  log "Switched current -> releases/$DEPLOYED_RELEASE_DIR"
+  sudo_cmd ln -sfn "releases/$VERSION" "$CURRENT_LINK"
+  log "Switched current -> releases/$VERSION"
   if [[ -n "$prev_target" ]]; then
     log "Previous release: $prev_target"
   fi
@@ -473,7 +437,7 @@ extract_and_install() {
   # --- Prune old releases ---
   prune_old_releases
 
-  log "Files deployed to: $release_dir (current -> releases/$DEPLOYED_RELEASE_DIR)"
+  log "Files deployed to: $release_dir (current -> releases/$VERSION)"
 }
 
 # =============================================================================
@@ -547,14 +511,6 @@ EOF
 # Step 5: Post-install
 # =============================================================================
 post_install() {
-  local active_release="$DEPLOYED_RELEASE_DIR"
-  if [[ -z "$active_release" && -L "$CURRENT_LINK" ]]; then
-    active_release="$(readlink "$CURRENT_LINK" | sed 's|^releases/||')"
-  fi
-  if [[ -z "$active_release" ]]; then
-    active_release="$VERSION"
-  fi
-
   # Record version in shared dir
   sudo_cmd tee "$SHARED_DIR/.atmos/version" > /dev/null <<< "$VERSION"
 
@@ -570,7 +526,7 @@ EOF
   echo "========================================="
   echo "  ATMOS $VERSION deployed to $INSTALL_ROOT"
   echo "  Mode: $MODE"
-  echo "  Layout: versioned (current -> releases/$active_release)"
+  echo "  Layout: versioned (current -> releases/$VERSION)"
   echo "========================================="
   echo ""
 
@@ -578,7 +534,7 @@ EOF
   echo "Available releases:"
   for d in "$RELEASES_DIR"/*/; do
     local v="$(basename "$d")"
-    if [[ "$v" == "$active_release" ]]; then
+    if [[ "$v" == "$VERSION" ]]; then
       echo "  * $v  (active)"
     else
       echo "    $v"
@@ -626,7 +582,6 @@ main() {
   ensure_sudo_ready
   resolve_version
   download_release
-  stop_existing_stack_for_upgrade
   extract_and_install "$TARBALL_PATH" "$TEMP_DIR"
   post_install
 
