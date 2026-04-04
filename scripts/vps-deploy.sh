@@ -255,23 +255,6 @@ install_dependencies() {
   fi
 
   log "Dependencies OK: curl, tar, docker, docker compose"
-
-  printf '%s Suggested commands (try in order):
-' "$(ts)"
-  printf '%s   1) Show listeners:
-' "$(ts)"
-  printf '%s      sudo ss -lntp | egrep ":(80|443|8080)\\b"\n' "$(ts)"
-  printf '%s   2) If these ports are used by a previous ATMOS stack in this folder:
-' "$(ts)"
-  printf '%s      docker compose --profile "*" down
-' "$(ts)"
-  printf '%s   3) If you want a clean reset (WARNING: deletes volumes and data for this project):
-' "$(ts)"
-  printf '%s      docker compose --profile "*" down -v
-' "$(ts)"
-  printf '%s %s  4) EMERGENCY: Stop ALL containers system-wide (RISKY - affects other projects):%s\n' "$(ts)" "${red}" "${reset}"
-  printf '%s      docker stop $(docker ps -q)\n' "$(ts)"
-  printf '%s %s========================================%s\n' "$(ts)" "${yellow}" "${reset}"
 }
 
 # =============================================================================
