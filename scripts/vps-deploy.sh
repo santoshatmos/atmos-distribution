@@ -59,6 +59,20 @@ log()  { echo "[atmos-deploy] $*"; }
 err()  { echo "[atmos-deploy] ERROR: $*" >&2; }
 warn() { echo "[atmos-deploy] WARN: $*" >&2; }
 
+# Timestamp helper for consistent formatting
+ts() { date "+%Y/%m/%d %H:%M:%S"; }
+
+# Color helpers (best-effort, no error if tput unavailable)
+red="" yellow="" reset=""
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+  ncolors="$(tput colors 2>/dev/null || echo 0)"
+  if [[ "$ncolors" -ge 8 ]]; then
+    red="$(tput setaf 1)"
+    yellow="$(tput setaf 3)"
+    reset="$(tput sgr0)"
+  fi
+fi
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
