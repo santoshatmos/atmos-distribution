@@ -368,6 +368,18 @@ extract_and_install() {
   if [[ -L "$CURRENT_LINK" ]]; then
     current_target="$(readlink "$CURRENT_LINK" 2>/dev/null | sed 's|^releases/||' || true)"
   fi
+
+  # Heal legacy/broken layout where current/.env was accidentally turned into
+  # a regular file (instead of symlink to shared/.env). In that case shared/.env
+  # may be stale while the latest values live in current/.env.
+  local current_env="$CURRENT_LINK/.env"
+  if [[ -f "$current_env" && ! -L "$current_env" ]]; then
+    warn "Detected non-symlink current/.env. Recovering latest values into shared/.env before upgrade."
+    sudo_cmd mkdir -p "$SHARED_DIR"
+    sudo_cmd cp -a "$current_env" "$SHARED_DIR/.env"
+    log "Recovered shared/.env from current/.env"
+  fi
+
   if [[ -d "$release_dir" ]]; then
     if [[ "$current_target" == "$VERSION" ]]; then
       local ts
