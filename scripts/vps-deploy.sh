@@ -415,12 +415,14 @@ extract_and_install() {
   done
 
   # --- Atomic switch: update current symlink ---
+  local release_name
+  release_name="$(basename "$release_dir")"
   local prev_target=""
   if [[ -L "$CURRENT_LINK" ]]; then
     prev_target="$(readlink "$CURRENT_LINK")"
   fi
-  sudo_cmd ln -sfn "releases/$VERSION" "$CURRENT_LINK"
-  log "Switched current -> releases/$VERSION"
+  sudo_cmd ln -sfn "releases/$release_name" "$CURRENT_LINK"
+  log "Switched current -> releases/$release_name"
   if [[ -n "$prev_target" ]]; then
     log "Previous release: $prev_target"
   fi
@@ -434,7 +436,7 @@ extract_and_install() {
   # --- Prune old releases ---
   prune_old_releases
 
-  log "Files deployed to: $release_dir (current -> releases/$VERSION)"
+  log "Files deployed to: $release_dir (current -> releases/$release_name)"
 }
 
 # =============================================================================
@@ -523,7 +525,9 @@ EOF
   echo "========================================="
   echo "  ATMOS $VERSION deployed to $INSTALL_ROOT"
   echo "  Mode: $MODE"
-  echo "  Layout: versioned (current -> releases/$VERSION)"
+  local current_target
+  current_target="$(readlink "$CURRENT_LINK" 2>/dev/null || echo "releases/$VERSION")"
+  echo "  Layout: versioned (current -> ${current_target})"
   echo "========================================="
   echo ""
 
@@ -531,7 +535,7 @@ EOF
   echo "Available releases:"
   for d in "$RELEASES_DIR"/*/; do
     local v="$(basename "$d")"
-    if [[ "$v" == "$VERSION" ]]; then
+    if [[ "releases/$v" == "$current_target" ]]; then
       echo "  * $v  (active)"
     else
       echo "    $v"
