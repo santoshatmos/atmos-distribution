@@ -341,6 +341,26 @@ extract_and_install() {
   local extract_dir="$tmp_dir/extracted"
   mkdir -p "$extract_dir"
 
+  # --- Fresh install: clean slate (remove old volumes to avoid credential mismatch) ---
+  if [[ "$MODE" == "install" ]]; then
+    if [[ -L "$CURRENT_LINK" && -f "$CURRENT_LINK/docker-compose.yml" ]]; then
+      echo ""
+      echo "${yellow}WARNING: --install will DELETE all existing data (database, uploads, config).${reset}"
+      echo "If you want to keep your data, use --upgrade instead."
+      echo ""
+      printf "Type 'yes' to continue: "
+      read -r confirm
+      if [[ "$confirm" != "yes" ]]; then
+        log "Aborted by user."
+        exit 0
+      fi
+      log "Install mode: stopping and removing existing containers and volumes..."
+      (cd "$CURRENT_LINK" && docker compose down -v --remove-orphans 2>/dev/null) || true
+    elif docker compose version >/dev/null 2>&1; then
+      docker volume rm atmos_mariadb_data atmos_wordpress_data atmos_engine_data atmos_redis_data 2>/dev/null || true
+    fi
+  fi
+
   # --- Pre-deploy backup (if upgrading an existing installation) ---
   if [[ "$MODE" == "upgrade" && -L "$CURRENT_LINK" ]]; then
     log "Running pre-deploy backup..."
