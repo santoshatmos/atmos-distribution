@@ -335,59 +335,101 @@ download_release() {
 # =============================================================================
 # Step 4: Extract and install (versioned)
 # =============================================================================
+
+# Helper: minimal inline DB backup when full backup.sh is not available
+_inline_db_backup() {
+  local backup_dir="$1"
+  local db_container="${COMPOSE_PROJECT_NAME:-atmos}_mariadb"
+  if docker ps --format '{{.Names}}' | grep -q "^${db_container}$"; then
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+    docker exec "$db_container" sh -c \
+      'exec mysqldump -uroot -p"${MYSQL_ROOT_PASSWORD}" --all-databases --single-transaction' \
+      | gzip > "$backup_dir/pre-deploy-${ts}.sql.gz" 2>/dev/null || warn "Inline DB backup failed"
+    log "Inline DB backup: $backup_dir/pre-deploy-${ts}.sql.gz"
+  else
+    warn "MariaDB container not running — skipping inline DB backup"
+  fi
+}
+
 extract_and_install() {
   local tarball="$1"
   local tmp_dir="$2"
   local extract_dir="$tmp_dir/extracted"
   mkdir -p "$extract_dir"
 
-  # --- Fresh install: clean slate (remove old volumes to avoid credential mismatch) ---
-  if [[ "$MODE" == "install" ]]; then
-    if [[ -L "$CURRENT_LINK" && -f "$CURRENT_LINK/docker-compose.yml" ]]; then
-      echo ""
-      echo "${yellow}WARNING: --install will DELETE all existing data (database, uploads, config).${reset}"
-      echo "If you want to keep your data, use --upgrade instead."
-      echo ""
-      printf "Type 'yes' to continue: "
-      read -r confirm < /dev/tty
-      if [[ "$confirm" != "yes" ]]; then
-        log "Aborted by user."
-        exit 0
-      fi
-      log "Install mode: stopping and removing existing containers and volumes..."
-      (cd "$CURRENT_LINK" && docker compose down -v --remove-orphans 2>/dev/null) || true
-    elif docker compose version >/dev/null 2>&1; then
-      docker volume rm atmos_mariadb_data atmos_wordpress_data atmos_engine_data atmos_redis_data 2>/dev/null || true
-    fi
-  fi
+  # --- Pre-deploy backup & cleanup ---
+  local backup_dir="$SHARED_DIR/backups"
+  sudo_cmd mkdir -p "$backup_dir"
 
-  # --- Pre-deploy backup (if upgrading an existing installation) ---
   if [[ "$MODE" == "upgrade" && -L "$CURRENT_LINK" ]]; then
-    log "Running pre-deploy backup..."
+    # UPGRADE: backup before deploy, no cleanup
+    log "Running pre-deploy backup (upgrade mode)..."
     local backup_script="$CURRENT_LINK/scripts/backup.sh"
-    local backup_dir="$SHARED_DIR/backups"
     if [[ -x "$backup_script" ]]; then
       BACKUP_MAX_KEEP=10 BACKUP_DIR="$backup_dir" "$backup_script" "$backup_dir" || warn "Pre-deploy backup failed (non-fatal, continuing deploy)"
     else
-      # Inline minimal DB backup if script not available in current release
-      sudo_cmd mkdir -p "$backup_dir"
-      local db_container="${COMPOSE_PROJECT_NAME:-atmos}_mariadb"
-      if docker ps --format '{{.Names}}' | grep -q "^${db_container}$"; then
-        local ts
-        ts="$(date +%Y%m%d-%H%M%S)"
-        docker exec "$db_container" sh -c \
-          'exec mysqldump -uroot -p"${MYSQL_ROOT_PASSWORD}" --all-databases --single-transaction' \
-          | gzip > "$backup_dir/pre-deploy-${ts}.sql.gz" 2>/dev/null || warn "DB backup failed"
-        log "Pre-deploy DB backup: $backup_dir/pre-deploy-${ts}.sql.gz"
-        # Rotate: keep max 10
-        local count
-        count=$(find "$backup_dir" -maxdepth 1 -name 'pre-deploy-*.sql.gz' -type f | wc -l)
-        if (( count > 10 )); then
-          find "$backup_dir" -maxdepth 1 -name 'pre-deploy-*.sql.gz' -type f -printf '%T@ %p\n' \
-            | sort -n | head -n $((count - 10)) | cut -d' ' -f2- \
-            | while IFS= read -r f; do rm -f "$f"; done
-        fi
+      _inline_db_backup "$backup_dir"
+    fi
+
+  elif [[ "$MODE" == "install" ]]; then
+    # INSTALL: backup existing data first, then rename old dir + clean all state
+    if [[ -d "$INSTALL_ROOT" ]] && { [[ -f "$INSTALL_ROOT/.atmos_installed" ]] || [[ -L "$CURRENT_LINK" ]] || [[ -f "$INSTALL_ROOT/docker-compose.yml" ]]; }; then
+      log "Existing installation detected. Backing up before clean install..."
+
+      # Try full backup if containers are running
+      local backup_script_path=""
+      if [[ -L "$CURRENT_LINK" && -x "$CURRENT_LINK/scripts/backup.sh" ]]; then
+        backup_script_path="$CURRENT_LINK/scripts/backup.sh"
+      elif [[ -x "$INSTALL_ROOT/scripts/backup.sh" ]]; then
+        backup_script_path="$INSTALL_ROOT/scripts/backup.sh"
       fi
+
+      if [[ -n "$backup_script_path" ]]; then
+        BACKUP_MAX_KEEP=10 BACKUP_DIR="$backup_dir" "$backup_script_path" "$backup_dir" || warn "Pre-install backup failed (non-fatal)"
+      else
+        _inline_db_backup "$backup_dir"
+      fi
+
+      # Rename old atmos directory (preserve as archive)
+      local archive_name="atmos-archive-$(date +%Y%m%d-%H%M%S)"
+      local archive_path="$(dirname "$INSTALL_ROOT")/$archive_name"
+      log "Archiving existing installation to: $archive_path"
+
+      # Stop all containers first
+      if [[ -f "$INSTALL_ROOT/docker-compose.yml" ]]; then
+        (cd "$INSTALL_ROOT" && docker compose down 2>/dev/null) || true
+      elif [[ -L "$CURRENT_LINK" && -f "$CURRENT_LINK/docker-compose.yml" ]]; then
+        (cd "$CURRENT_LINK" && docker compose down 2>/dev/null) || true
+      fi
+
+      # Remove Docker volumes (clean state)
+      log "Removing Docker volumes for clean state..."
+      local project="${COMPOSE_PROJECT_NAME:-atmos}"
+      docker volume rm "${project}_mariadb_data" 2>/dev/null || true
+      docker volume rm "${project}_wordpress_data" 2>/dev/null || true
+      docker volume rm "${project}_engine_data" 2>/dev/null || true
+      docker volume rm "${project}_redis_data" 2>/dev/null || true
+
+      # Move backups out before renaming
+      local tmp_backups=""
+      if [[ -d "$backup_dir" ]] && find "$backup_dir" -maxdepth 1 -name 'backup-*.tar.gz' -type f | grep -q .; then
+        tmp_backups="$(mktemp -d)"
+        cp "$backup_dir"/backup-*.tar.gz "$tmp_backups/" 2>/dev/null || true
+      fi
+
+      # Rename old directory
+      sudo_cmd mv "$INSTALL_ROOT" "$archive_path"
+      sudo_cmd mkdir -p "$INSTALL_ROOT"
+
+      # Restore backups into new directory
+      sudo_cmd mkdir -p "$backup_dir"
+      if [[ -n "$tmp_backups" && -d "$tmp_backups" ]]; then
+        cp "$tmp_backups"/backup-*.tar.gz "$backup_dir/" 2>/dev/null || true
+        rm -rf "$tmp_backups"
+      fi
+
+      log "Clean install environment ready. Old installation archived at: $archive_path"
     fi
   fi
 
