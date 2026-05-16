@@ -349,7 +349,7 @@ extract_and_install() {
       echo "If you want to keep your data, use --upgrade instead."
       echo ""
       printf "Type 'yes' to continue: "
-      read -r confirm
+      read -r confirm < /dev/tty
       if [[ "$confirm" != "yes" ]]; then
         log "Aborted by user."
         exit 0
