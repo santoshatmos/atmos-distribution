@@ -341,6 +341,36 @@ extract_and_install() {
   local extract_dir="$tmp_dir/extracted"
   mkdir -p "$extract_dir"
 
+  # --- Pre-deploy backup (if upgrading an existing installation) ---
+  if [[ "$MODE" == "upgrade" && -L "$CURRENT_LINK" ]]; then
+    log "Running pre-deploy backup..."
+    local backup_script="$CURRENT_LINK/scripts/backup.sh"
+    local backup_dir="$SHARED_DIR/backups"
+    if [[ -x "$backup_script" ]]; then
+      BACKUP_MAX_KEEP=10 BACKUP_DIR="$backup_dir" "$backup_script" "$backup_dir" || warn "Pre-deploy backup failed (non-fatal, continuing deploy)"
+    else
+      # Inline minimal DB backup if script not available in current release
+      sudo_cmd mkdir -p "$backup_dir"
+      local db_container="${COMPOSE_PROJECT_NAME:-atmos}_mariadb"
+      if docker ps --format '{{.Names}}' | grep -q "^${db_container}$"; then
+        local ts
+        ts="$(date +%Y%m%d-%H%M%S)"
+        docker exec "$db_container" sh -c \
+          'exec mysqldump -uroot -p"${MYSQL_ROOT_PASSWORD}" --all-databases --single-transaction' \
+          | gzip > "$backup_dir/pre-deploy-${ts}.sql.gz" 2>/dev/null || warn "DB backup failed"
+        log "Pre-deploy DB backup: $backup_dir/pre-deploy-${ts}.sql.gz"
+        # Rotate: keep max 10
+        local count
+        count=$(find "$backup_dir" -maxdepth 1 -name 'pre-deploy-*.sql.gz' -type f | wc -l)
+        if (( count > 10 )); then
+          find "$backup_dir" -maxdepth 1 -name 'pre-deploy-*.sql.gz' -type f -printf '%T@ %p\n' \
+            | sort -n | head -n $((count - 10)) | cut -d' ' -f2- \
+            | while IFS= read -r f; do rm -f "$f"; done
+        fi
+      fi
+    fi
+  fi
+
   log "Extracting release..."
   tar -xzf "$tarball" -C "$extract_dir"
 
@@ -599,7 +629,12 @@ main() {
   post_install
 
   log "Starting ATMOS from ${CURRENT_LINK}..."
-  (cd "$CURRENT_LINK" && ATMOS_INSTALL_REEXEC=1 ./start.sh)
+  local start_args=()
+  # Feature-ID: START-SKIP-SETUP-001
+  if [[ "$MODE" == "upgrade" ]]; then
+    start_args+=("--skip-setup")
+  fi
+  (cd "$CURRENT_LINK" && ATMOS_INSTALL_REEXEC=1 ./start.sh "${start_args[@]}")
 }
 
 main "$@"
