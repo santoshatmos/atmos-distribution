@@ -9,13 +9,15 @@ set -euo pipefail
 #   │   ├── v1.0.0/
 #   │   └── v1.0.1/
 #   ├── current -> releases/v1.0.1   (symlink, atomic switch)
-#   ├── shared/
-#   │   ├── .env
-#   │   ├── .atmos/
-#   │   ├── .atmos_installed
-#   │   ├── acme/
-#   │   └── nginx/ssl/
 #   └── scripts/
+#
+# Persistent state layout:
+#   /var/lib/atmos/shared/
+#   ├── .env
+#   ├── .atmos/
+#   ├── .atmos_installed
+#   ├── acme/
+#   └── nginx/ssl/
 #
 # Usage (first-time install or upgrade - auto-detected):
 #   curl -fsSL https://raw.githubusercontent.com/santoshatmos/atmos-distribution/main/scripts/vps-deploy.sh | bash
@@ -29,6 +31,7 @@ set -euo pipefail
 # Environment variables:
 #   ATMOS_VERSION          - Release tag to deploy (default: latest)
 #   ATMOS_INSTALL_ROOT     - Installation directory (default: /opt/atmos)
+#   ATMOS_PERSIST_ROOT     - Persistent state directory (default: /var/lib/atmos)
 #   ATMOS_RELEASE_BASE_URL - Override base URL for release artifacts
 #   ATMOS_KEEP_RELEASES    - Number of old releases to keep (default: 3)
 
@@ -38,8 +41,10 @@ ATMOS_RELEASE_BASE_URL="${ATMOS_RELEASE_BASE_URL:-}"
 SCRIPT_URL="https://raw.githubusercontent.com/${DIST_REPO_OWNER}/${DIST_REPO_NAME}/main/scripts/vps-deploy.sh"
 VERSION="${ATMOS_VERSION:-latest}"
 INSTALL_ROOT="${ATMOS_INSTALL_ROOT:-/opt/atmos}"
+PERSIST_ROOT="${ATMOS_PERSIST_ROOT:-/var/lib/atmos}"
 RELEASES_DIR="$INSTALL_ROOT/releases"
-SHARED_DIR="$INSTALL_ROOT/shared"
+SHARED_DIR="$PERSIST_ROOT/shared"
+LEGACY_SHARED_DIR="$INSTALL_ROOT/shared"
 CURRENT_LINK="$INSTALL_ROOT/current"
 KEEP_RELEASES="${ATMOS_KEEP_RELEASES:-3}"
 
@@ -94,6 +99,7 @@ while [[ $# -gt 0 ]]; do
       echo "Environment:"
       echo "  ATMOS_VERSION            Release tag (default: latest)"
       echo "  ATMOS_INSTALL_ROOT       Install directory (default: /opt/atmos)"
+      echo "  ATMOS_PERSIST_ROOT       Persistent state directory (default: /var/lib/atmos)"
       echo "  ATMOS_RELEASE_BASE_URL   Override artifact base URL"
       echo "  ATMOS_KEEP_RELEASES      Old releases to retain (default: 3)"
       exit 0
@@ -139,7 +145,7 @@ ensure_sudo_ready() {
   echo ""
   echo "=============================================================="
   echo "  ATTENTION: SUDO PASSWORD REQUIRED"
-  echo "  ATMOS needs elevated privileges to write under: $INSTALL_ROOT"
+  echo "  ATMOS needs elevated privileges to write under: $INSTALL_ROOT and $PERSIST_ROOT"
   echo "=============================================================="
   echo ""
   # Prompt once early to make UX explicit and avoid surprise during file copy.
@@ -188,6 +194,84 @@ ensure_env_key_value() {
     sudo_cmd sed -i -E "s|^[[:space:]]*${key}=.*$|${key}=${value}|" "$env_file"
   else
     sudo_cmd sh -c "printf '\n%s=%s\n' '${key}' '${value}' >> '$env_file'"
+  fi
+}
+
+shared_candidate_has_state() {
+  local candidate="$1"
+  [[ -d "$candidate" ]] || return 1
+  [[ -f "$candidate/.env" || -d "$candidate/.atmos" || -d "$candidate/acme" || -d "$candidate/nginx" ]]
+}
+
+cert_looks_usable() {
+  local cert="$1"
+  local key="$2"
+  [[ -s "$cert" && -s "$key" ]] || return 1
+  if ! grep -q "BEGIN CERTIFICATE" "$cert" 2>/dev/null; then
+    return 1
+  fi
+  if command -v openssl >/dev/null 2>&1 && openssl x509 -in "$cert" -noout -subject -issuer -checkend 2592000 >/tmp/atmos-cert-check.$$ 2>&1; then
+    local subject issuer
+    subject="$(openssl x509 -in "$cert" -noout -subject 2>/dev/null || true)"
+    issuer="$(openssl x509 -in "$cert" -noout -issuer 2>/dev/null || true)"
+    rm -f /tmp/atmos-cert-check.$$
+    if echo "$subject" | grep -qi "CN[ =]*localhost"; then
+      return 1
+    fi
+    if [[ "$subject" == "${issuer/issuer=/subject=}" ]]; then
+      return 1
+    fi
+    return 0
+  fi
+  rm -f /tmp/atmos-cert-check.$$
+  return 1
+}
+
+sanitize_shared_ssl_dir() {
+  local ssl_dir="$1"
+  [[ -d "$ssl_dir" ]] || return 0
+  if [[ -e "$ssl_dir/fullchain.pem" || -e "$ssl_dir/privkey.pem" ]]; then
+    if ! cert_looks_usable "$ssl_dir/fullchain.pem" "$ssl_dir/privkey.pem"; then
+      warn "Ignoring invalid/bootstrap default SSL files under $ssl_dir"
+      sudo_cmd rm -f "$ssl_dir/fullchain.pem" "$ssl_dir/privkey.pem"
+    fi
+  fi
+  local d
+  for d in "$ssl_dir"/*; do
+    [[ -d "$d" ]] || continue
+    [[ "$(basename "$d")" != ".bootstrap" ]] || continue
+    if [[ -e "$d/fullchain.pem" || -e "$d/privkey.pem" ]]; then
+      if ! cert_looks_usable "$d/fullchain.pem" "$d/privkey.pem"; then
+        warn "Ignoring invalid/bootstrap domain SSL files under $d"
+        sudo_cmd rm -rf "$d"
+      fi
+    fi
+  done
+}
+
+recover_or_create_shared_dir() {
+  # Feature-ID: ATMOS-PERSIST-ROOT-001
+  # Persistent state must survive /opt/atmos replacement; keep it under /var/lib/atmos by default.
+  if shared_candidate_has_state "$SHARED_DIR"; then
+    sanitize_shared_ssl_dir "$SHARED_DIR/nginx/ssl"
+    return 0
+  fi
+
+  local source=""
+  if shared_candidate_has_state "$LEGACY_SHARED_DIR"; then
+    source="$LEGACY_SHARED_DIR"
+  else
+    source="$(find "$(dirname "$INSTALL_ROOT")" -maxdepth 2 -path "$(dirname "$INSTALL_ROOT")/$(basename "$INSTALL_ROOT")-archive-*/shared" -type d 2>/dev/null | sort -r | head -n 1 || true)"
+  fi
+
+  if [[ -n "$source" && -d "$source" ]]; then
+    log "Recovering persistent shared state from: $source"
+    sudo_cmd mkdir -p "$(dirname "$SHARED_DIR")"
+    sudo_cmd mkdir -p "$SHARED_DIR"
+    sudo_cmd cp -a "$source"/. "$SHARED_DIR"/
+    sanitize_shared_ssl_dir "$SHARED_DIR/nginx/ssl"
+  else
+    sudo_cmd mkdir -p "$SHARED_DIR"
   fi
 }
 
@@ -462,7 +546,9 @@ extract_and_install() {
   fi
 
   # --- Ensure directory structure ---
-  sudo_cmd mkdir -p "$RELEASES_DIR" "$SHARED_DIR" "$SHARED_DIR/nginx"
+  sudo_cmd mkdir -p "$RELEASES_DIR" "$PERSIST_ROOT"
+  recover_or_create_shared_dir
+  sudo_cmd mkdir -p "$SHARED_DIR" "$SHARED_DIR/nginx"
 
   # --- Deploy release to releases/<version>/ ---
   # If target version equals currently active release, use timestamped directory to avoid
