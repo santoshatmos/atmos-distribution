@@ -179,6 +179,18 @@ relpath() {
     || echo "$2"
 }
 
+ensure_env_key_value() {
+  local env_file="$1"
+  local key="$2"
+  local value="$3"
+  sudo_cmd touch "$env_file"
+  if sudo_cmd grep -Eq "^[[:space:]]*${key}=" "$env_file"; then
+    sudo_cmd sed -i -E "s|^[[:space:]]*${key}=.*$|${key}=${value}|" "$env_file"
+  else
+    sudo_cmd sh -c "printf '\n%s=%s\n' '${key}' '${value}' >> '$env_file'"
+  fi
+}
+
 # Create symlinks from release dir to shared dir for persistent data
 link_shared_into_release() {
   local release_dir="$1"
@@ -507,6 +519,10 @@ extract_and_install() {
       sudo_cmd cp -a "$release_dir/.env.example" "$SHARED_DIR/.env"
     fi
   fi
+  # Feature-ID: ACME-SHARED-MOUNT-001
+  # Pin compose SSL/ACME mounts to shared absolute paths in versioned deploy layout.
+  ensure_env_key_value "$SHARED_DIR/.env" "ATMOS_SHARED_SSL_DIR" "$SHARED_DIR/nginx/ssl"
+  ensure_env_key_value "$SHARED_DIR/.env" "ATMOS_SHARED_ACME_DIR" "$SHARED_DIR/acme"
   # Ensure shared state dirs exist
   sudo_cmd mkdir -p "$SHARED_DIR/.atmos/cache" "$SHARED_DIR/.atmos/presets" 2>/dev/null || true
 
