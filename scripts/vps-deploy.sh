@@ -61,7 +61,7 @@ SHARED_ITEMS=(
 MODE=""   # auto-detected below
 
 log()  { echo "[atmos-deploy] $*"; }
-err()  { echo "[atmos-deploy] ERROR: $*" >&2; }
+err()  { echo "${red}[atmos-deploy] ERROR: $*${reset}" >&2; }
 warn() { echo "[atmos-deploy] WARN: $*" >&2; }
 
 # Timestamp helper for consistent formatting
@@ -463,7 +463,8 @@ extract_and_install() {
     log "Running pre-deploy backup (upgrade mode)..."
     local backup_script="$CURRENT_LINK/scripts/backup.sh"
     if [[ -x "$backup_script" ]]; then
-      BACKUP_MAX_KEEP=10 BACKUP_DIR="$backup_dir" "$backup_script" "$backup_dir" || warn "Pre-deploy backup failed (non-fatal, continuing deploy)"
+      # Bug-ID: ATMOS-UPGRADE-BACKUP-VISIBILITY-001
+      BACKUP_MAX_KEEP=10 BACKUP_DIR="$backup_dir" "$backup_script" "$backup_dir" || err "Pre-deploy backup failed. Continuing upgrade without a backup snapshot."
     else
       _inline_db_backup "$backup_dir"
     fi
