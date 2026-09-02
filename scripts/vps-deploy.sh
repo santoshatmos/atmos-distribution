@@ -454,6 +454,30 @@ extract_and_install() {
   local extract_dir="$tmp_dir/extracted"
   mkdir -p "$extract_dir"
 
+  # Validate the artifact before any backup, shutdown, cleanup, or filesystem
+  # switch. A malformed release must be rejected without changing the active
+  # installation.
+  log "Extracting release..."
+  tar -xzf "$tarball" -C "$extract_dir"
+
+  # Find the extracted directory (atmos-deploy-vX.Y.Z/)
+  local inner_dir
+  inner_dir="$(find "$extract_dir" -maxdepth 1 -mindepth 1 -type d | head -n 1)"
+  if [[ -z "$inner_dir" ]]; then
+    err "Tarball does not contain expected directory structure."
+    exit 1
+  fi
+
+  # Validate required bind-mount sources before touching the active release or
+  # invoking Docker. If this file is absent, Docker creates a directory at the
+  # host path and the next run fails with a directory/file mount mismatch.
+  local nginx_start="$inner_dir/nginx/start-nginx.sh"
+  if [[ ! -f "$nginx_start" ]]; then
+    err "Release tarball is invalid: nginx/start-nginx.sh must be a regular file."
+    err "No release was activated and Docker was not changed."
+    exit 1
+  fi
+
   # --- Pre-deploy backup & cleanup ---
   local backup_dir="$SHARED_DIR/backups"
   sudo_cmd mkdir -p "$backup_dir"
@@ -528,17 +552,6 @@ extract_and_install() {
 
       log "Clean install environment ready. Old installation archived at: $archive_path"
     fi
-  fi
-
-  log "Extracting release..."
-  tar -xzf "$tarball" -C "$extract_dir"
-
-  # Find the extracted directory (atmos-deploy-vX.Y.Z/)
-  local inner_dir
-  inner_dir="$(find "$extract_dir" -maxdepth 1 -mindepth 1 -type d | head -n 1)"
-  if [[ -z "$inner_dir" ]]; then
-    err "Tarball does not contain expected directory structure."
-    exit 1
   fi
 
   # --- Wipe legacy flat layout if detected ---
