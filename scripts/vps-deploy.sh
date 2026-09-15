@@ -477,6 +477,12 @@ extract_and_install() {
     err "No release was activated and Docker was not changed."
     exit 1
   fi
+  local nginx_dockerfile="$inner_dir/nginx/Dockerfile"
+  if [[ ! -f "$nginx_dockerfile" ]]; then
+    err "Release tarball is invalid: nginx/Dockerfile is required for deterministic startup."
+    err "No release was activated and Docker was not changed."
+    exit 1
+  fi
 
   # --- Pre-deploy backup & cleanup ---
   local backup_dir="$SHARED_DIR/backups"
