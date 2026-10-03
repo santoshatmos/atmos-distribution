@@ -152,6 +152,58 @@ ensure_sudo_ready() {
   sudo -v
 }
 
+# Ensure Linux has a persistent 4G swap area. This is intentionally checked
+# before every install/upgrade: an already-active swap device or file means
+# the host is configured, regardless of its size or path.
+ensure_swap() {
+  local swap_file="/swapfile"
+
+  if [[ -r /proc/swaps ]] && awk 'NR > 1 && NF { found=1 } END { exit(found ? 0 : 1) }' /proc/swaps; then
+    log "Active swap detected; leaving existing swap configuration unchanged."
+    return 0
+  fi
+
+  if ! command -v mkswap >/dev/null 2>&1 || ! command -v swapon >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      err "mkswap/swapon are required to create swap, and apt-get is unavailable."
+      exit 1
+    fi
+    log "Installing util-linux for swap management..."
+    sudo_cmd apt-get update -qq
+    sudo_cmd apt-get install -y -qq util-linux
+  fi
+
+  # Recover an existing but inactive conventional swap file instead of
+  # overwriting it. This keeps reruns safe even after an interrupted deploy.
+  if [[ -e "$swap_file" ]]; then
+    log "Swap file exists but is inactive; attempting to enable it..."
+    if sudo_cmd swapon "$swap_file" 2>/dev/null; then
+      if ! sudo_cmd grep -qE '^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap([[:space:]]|$)' /etc/fstab 2>/dev/null; then
+        sudo_cmd sh -c "printf '%s\\n' '/swapfile none swap sw 0 0' >> /etc/fstab"
+      fi
+      log "Existing swap file enabled."
+      return 0
+    fi
+    err "$swap_file exists but could not be enabled; refusing to overwrite it."
+    exit 1
+  fi
+
+  log "Creating 4G swap file at $swap_file..."
+  if command -v fallocate >/dev/null 2>&1; then
+    sudo_cmd fallocate -l 4G "$swap_file"
+  else
+    sudo_cmd dd if=/dev/zero of="$swap_file" bs=1M count=4096
+  fi
+  sudo_cmd chmod 600 "$swap_file"
+  sudo_cmd mkswap "$swap_file" >/dev/null
+  sudo_cmd swapon "$swap_file"
+
+  if ! sudo_cmd grep -qE '^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap([[:space:]]|$)' /etc/fstab 2>/dev/null; then
+    sudo_cmd sh -c "printf '%s\\n' '/swapfile none swap sw 0 0' >> /etc/fstab"
+  fi
+  log "4G swap enabled and persisted in /etc/fstab."
+}
+
 validate_tarball() {
   local tarball="$1"
   if [[ ! -s "$tarball" ]]; then
@@ -351,6 +403,52 @@ install_dependencies() {
   fi
 
   log "Dependencies OK: curl, tar, docker, docker compose"
+}
+
+# Install the boot-time Compose entrypoint once the versioned `current`
+# symlink exists. Docker's own restart policies do not reliably restore a
+# container that was cleanly stopped while the daemon was shutting down, so
+# the stack needs an explicit systemd unit as its boot orchestration layer.
+ensure_stack_systemd_service() {
+  if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
+    warn "systemd is unavailable; skipping atmos-stack.service installation."
+    return 0
+  fi
+
+  local unit_path="/etc/systemd/system/atmos-stack.service"
+  local unit_tmp
+  unit_tmp="$(mktemp)"
+  cat > "$unit_tmp" <<EOF
+[Unit]
+Description=ATMOS Docker Compose stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$CURRENT_LINK
+ExecStart=$CURRENT_LINK/start-stack.sh
+RemainAfterExit=yes
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  local unit_changed=0
+  if [[ ! -r "$unit_path" ]] || ! cmp -s "$unit_tmp" "$unit_path"; then
+    sudo_cmd install -o root -g root -m 0644 "$unit_tmp" "$unit_path"
+    unit_changed=1
+  fi
+  rm -f "$unit_tmp"
+
+  if (( unit_changed )); then
+    sudo_cmd systemctl daemon-reload
+    log "Installed/updated atmos-stack.service."
+  fi
+  sudo_cmd systemctl enable atmos-stack.service >/dev/null
+  log "Enabled atmos-stack.service for boot-time Compose startup."
 }
 
 # =============================================================================
@@ -807,9 +905,11 @@ main() {
 
   install_dependencies
   ensure_sudo_ready
+  ensure_swap
   resolve_version
   download_release
   extract_and_install "$TARBALL_PATH" "$TEMP_DIR"
+  ensure_stack_systemd_service
   post_install
 
   log "Starting ATMOS from ${CURRENT_LINK}..."
