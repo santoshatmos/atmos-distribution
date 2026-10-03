@@ -249,6 +249,32 @@ ensure_env_key_value() {
   fi
 }
 
+ensure_env_key_if_legacy() {
+  local env_file="$1"
+  local key="$2"
+  local value="$3"
+  shift 3
+
+  local current
+  current="$(sudo_cmd sed -n -E "s/^[[:space:]]*${key}=([^#[:space:]]*).*/\1/p" "$env_file" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$current" ]]; then
+    ensure_env_key_value "$env_file" "$key" "$value"
+    log "Added managed runtime default: ${key}=${value}"
+    return 0
+  fi
+
+  local legacy
+  for legacy in "$@"; do
+    if [[ "$current" == "$legacy" ]]; then
+      ensure_env_key_value "$env_file" "$key" "$value"
+      log "Migrated legacy runtime default: ${key}=${current} -> ${value}"
+      return 0
+    fi
+  done
+
+  log "Preserving custom runtime setting: ${key}=${current}"
+}
+
 shared_candidate_has_state() {
   local candidate="$1"
   [[ -d "$candidate" ]] || return 1
@@ -727,6 +753,12 @@ extract_and_install() {
   # Pin compose SSL/ACME mounts to shared absolute paths in versioned deploy layout.
   ensure_env_key_value "$SHARED_DIR/.env" "ATMOS_SHARED_SSL_DIR" "$SHARED_DIR/nginx/ssl"
   ensure_env_key_value "$SHARED_DIR/.env" "ATMOS_SHARED_ACME_DIR" "$SHARED_DIR/acme"
+  # Feature-ID: ATMOS-MEMORY-TUNING-MIGRATION-001
+  # Existing installations keep their shared .env across releases, so new
+  # defaults in .env.example are not applied automatically. Migrate only the
+  # known legacy defaults and preserve explicit operator overrides.
+  ensure_env_key_if_legacy "$SHARED_DIR/.env" "MARIADB_INNODB_BUFFER_POOL_SIZE" "768M" "512M" "512m"
+  ensure_env_key_if_legacy "$SHARED_DIR/.env" "REDIS_MAXMEMORY" "1gb" "768mb" "768MB" "768m"
   # Ensure shared state dirs exist
   sudo_cmd mkdir -p "$SHARED_DIR/.atmos/cache" "$SHARED_DIR/.atmos/presets" 2>/dev/null || true
 
